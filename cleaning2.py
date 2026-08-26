@@ -680,7 +680,7 @@ def salvar_parametros(
 
 if __name__ == '__main__':
     # Arquivo de entrada: um objeto JSON por linha.
-    caminho_do_arquivo = 'reports_redacted.jsonl'
+    caminho_do_arquivo = 'dataset/reports_redacted.jsonl'
 
     # Arquivo com todos os documentos e seus clusters.
     arquivo_completo = 'dataset_occam_hdbscan_completo.csv'
