@@ -9,7 +9,7 @@ Fluxo geral:
       -> divisão dos documentos em blocos compatíveis com o tokenizer
       -> embeddings semânticos com SentenceTransformer
       -> média dos embeddings dos blocos por documento
-      -> redução de dimensionalidade com UMAP
+      -> redução de dimensionalidade com PCA determinística
       -> agrupamento com HDBSCAN
       -> exportação da base completa
       -> geração de amostra para revisão manual
@@ -21,6 +21,12 @@ como os demais clusters.
 """
 
 import json
+import os
+
+# Solicita comportamento determinístico nas operações CUDA quando possível.
+# Deve ser definido antes do carregamento do PyTorch.
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+
 # Biblioteca padrão para limpeza e identificação de padrões textuais por regex.
 import re
 from pathlib import Path
@@ -29,32 +35,58 @@ from pathlib import Path
 import hdbscan
 import numpy as np
 import pandas as pd
+import torch
+from sklearn.decomposition import PCA
+
 # SentenceTransformer gera embeddings semânticos dos textos.
 from sentence_transformers import SentenceTransformer
-# UMAP reduz a dimensionalidade dos embeddings antes do HDBSCAN.
-from umap import UMAP
+
+# Solicita algoritmos determinísticos no PyTorch. warn_only=True evita que uma
+# operação específica sem implementação determinística interrompa o programa.
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 # ---------------------------------------------------------------------------
 # Configurações globais da execução
 # ---------------------------------------------------------------------------
 
-# Modelo multilíngue usado para representar textos em português e inglês.
-MODEL_NAME = 'BAAI/bge-m3'
+# Modelo somente em inglês para gerar embeddings semânticos.
+# O Nomic exige trust_remote_code=True nas versões antigas do
+# SentenceTransformers/Transformers.
+MODEL_NAME = 'nomic-ai/nomic-embed-text-v1.5'
 
-# Seed do UMAP. Ajuda a obter resultados reproduzíveis entre execuções
-# feitas com as mesmas versões das bibliotecas e os mesmos dados.
-RANDOM_STATE = 10
+# Prefixo recomendado pelo model card do Nomic para agrupar textos por tema.
+NOMIC_TASK_PREFIX = 'clustering: '
 
-# Seed usada para selecionar sempre a mesma amostra manual por cluster.
+# Seed usada somente para selecionar sempre a mesma amostra manual por cluster.
+# Ela não participa da geração dos clusters.
 SAMPLE_RANDOM_STATE = 42
+
+# A redução de dimensionalidade usa PCA com svd_solver='full', que não
+# depende de uma seed aleatória.
+DETERMINISTIC_DIMENSIONALITY_REDUCTION = 'PCA(svd_solver=full)'
 
 # Quantidade padrão de documentos selecionados para cada cluster na amostra.
 DEFAULT_SAMPLE_SIZE = 3
 
 # Quantidade de textos processados simultaneamente pelo SentenceTransformer.
-# O valor deve ser reduzido se houver pouca memória disponível.
-DEFAULT_BATCH_SIZE = 32
+# Começa em 16 para equilibrar velocidade e memória. Reduza para 8 ou 4
+# se houver pouca VRAM/RAM disponível.
+DEFAULT_BATCH_SIZE = 16
+
+# Limite desejado de tokens por bloco. O Nomic aceita sequências longas,
+# mas blocos de 512 tokens evitam misturar subtemas durante o clustering.
+MAX_TOKENS_POR_BLOCO = 512
+
+# Número máximo de componentes usados pela PCA antes do HDBSCAN.
+# Até 50 componentes preservam mais informação sem retornar à dimensão completa.
+PCA_COMPONENTS = 50
+
+# Sensibilidade do HDBSCAN à densidade local. Valores menores permitem que
+# mais pontos entrem em clusters, mas podem reduzir a conservadoriedade.
+HDBSCAN_MIN_SAMPLES = 5
 
 # Tamanho mínimo padrão para que o HDBSCAN forme um cluster válido.
 DEFAULT_MIN_CLUSTER_SIZE = 15
@@ -298,7 +330,7 @@ def embedding_documentos_longos(
         Modelo de embeddings já carregado.
     documentos : list[str]
         Textos limpos que serão representados.
-    batch_size : int, default=32
+    batch_size : int, default=16
         Número de blocos enviados simultaneamente ao modelo.
 
     Retorno
@@ -315,38 +347,52 @@ def embedding_documentos_longos(
     # Lista global de todos os blocos de todos os documentos.
     todos_os_blocos = []
 
-    # Para cada bloco, registra o índice do documento de origem. Isso permite
-    # reconstruir um vetor único por documento depois do encode.
-    documento_dos_blocos = []
+    # Guarda diretamente os índices dos blocos de cada documento. Isso evita
+    # percorrer todos os blocos novamente para cada documento na agregação.
+    indices_por_documento = [[] for _ in documentos]
 
     # Obtém a dimensão do embedding para criar vetores nulos em casos vazios.
     dimensao = modelo.get_sentence_embedding_dimension()
 
     # Cria os blocos de cada documento usando o tokenizer do modelo.
     for indice_documento, texto in enumerate(documentos):
-        blocos = _blocos_por_tokenizer(modelo, texto, max_tokens_por_bloco=512, margem_tokens=2)
+        blocos = _blocos_por_tokenizer(
+            modelo,
+            texto,
+            max_tokens_por_bloco=MAX_TOKENS_POR_BLOCO,
+            margem_tokens=2,
+        )
 
         # Textos vazios são ignorados nesta etapa. Em condições normais,
         # eles já foram removidos por carregar_e_limpar_dados.
         if not blocos:
             continue
 
+        # Registra os índices que esses blocos ocuparão na lista global.
+        inicio_blocos = len(todos_os_blocos)
+        indices_por_documento[indice_documento] = list(
+            range(inicio_blocos, inicio_blocos + len(blocos))
+        )
+
         # Adiciona os blocos à lista global.
         todos_os_blocos.extend(blocos)
-
-        # Registra o documento proprietário de cada bloco.
-        documento_dos_blocos.extend(
-            [indice_documento] * len(blocos)
-        )
 
     # Se nenhum bloco foi criado, não é possível gerar embeddings.
     if not todos_os_blocos:
         raise ValueError('Nenhum bloco válido foi criado para os embeddings.')
 
+    # O Nomic exige um prefixo de tarefa. Para este pipeline, usamos
+    # `clustering:` porque os embeddings serão agrupados por similaridade
+    # temática, e não usados para busca de consultas.
+    blocos_com_prefixo = [
+        f'{NOMIC_TASK_PREFIX}{bloco}'
+        for bloco in todos_os_blocos
+    ]
+
     # Gera embeddings em lote. A normalização facilita comparações baseadas
     # em cosseno e reduz o efeito de diferenças de magnitude entre vetores.
     embeddings_blocos = modelo.encode(
-        todos_os_blocos,
+        blocos_com_prefixo,
         batch_size=batch_size,
         normalize_embeddings=True,
         convert_to_numpy=True,
@@ -357,12 +403,8 @@ def embedding_documentos_longos(
 
     # Reconstrói um embedding para cada documento original, na mesma ordem.
     for indice_documento in range(len(documentos)):
-        # Localiza os blocos pertencentes ao documento atual.
-        indices = [
-            i
-            for i, dono in enumerate(documento_dos_blocos)
-            if dono == indice_documento
-        ]
+        # Recupera diretamente os índices dos blocos do documento atual.
+        indices = indices_por_documento[indice_documento]
 
         # Se o documento não gerou blocos, usa vetor nulo. Esse caso é
         # defensivo; a limpeza normalmente impede que ele ocorra.
@@ -388,91 +430,111 @@ def embedding_documentos_longos(
 # ---------------------------------------------------------------------------
 
 
+def expandir_registros_por_linha(dados):
+    """
+    Cria um registro independente para cada linha de ``summary``.
+
+    Cada objeto do JSONL original é um relatório. Depois de decodificar o
+    JSON, o conteúdo do campo ``summary`` é dividido nas quebras de linha.
+    Para cada trecho, todos os metadados originais são copiados: ``sender``,
+    ``subject``, ``specialist``, ``source_type``, ``source_tag``, datas e
+    quaisquer outras colunas presentes no objeto original.
+
+    Como um ``message_id`` original pode gerar vários registros, ele é mantido
+    em ``original_message_id``. O novo ``message_id`` recebe um sufixo de linha
+    para continuar sendo único e permitir uma decisão manual inequívoca.
+    """
+    registros_expandidos = []
+
+    for registro in dados:
+        registro_original = dict(registro)
+        id_original = registro_original.get('message_id')
+        summary = registro_original.get('summary')
+
+        if not isinstance(summary, str):
+            partes = ['']
+        else:
+            # ``splitlines`` trata \\n, \\r\\n e outras quebras usuais.
+            # Linhas vazias são ignoradas, pois não representam conteúdo.
+            partes = [parte.strip() for parte in summary.splitlines() if parte.strip()]
+            if not partes:
+                partes = ['']
+
+        for numero_linha, parte in enumerate(partes, start=1):
+            novo_registro = dict(registro_original)
+            novo_registro['original_message_id'] = id_original
+            novo_registro['message_id'] = f'{id_original}__line_{numero_linha:04d}'
+            novo_registro['summary_line_number'] = numero_linha
+            novo_registro['summary'] = parte
+            registros_expandidos.append(novo_registro)
+
+    return registros_expandidos
+
+
 def carregar_e_limpar_dados(caminho_arquivo):
     """
-    Carrega o JSONL, valida rastreabilidade e aplica a limpeza textual.
+    Carrega o JSONL, divide cada ``summary`` por quebra de linha e limpa os
+    registros resultantes.
 
-    O arquivo precisa conter um objeto JSON por linha e possuir, no mínimo,
-    as colunas ``message_id`` e ``summary``.
+    A quebra ``\\n`` dentro do JSON é convertida pelo ``json.loads`` em uma
+    quebra real. Cada trecho vira um registro separado, com todos os campos do
+    relatório original preservados e com um ID derivado único.
     """
-
     dados = []
 
-    # Abre o JSONL explicitamente em UTF-8 para preservar acentos e símbolos.
     with open(caminho_arquivo, 'r', encoding='utf-8') as arquivo:
-        # enumerate permite informar a linha exata quando houver JSON inválido.
         for numero_linha, linha in enumerate(arquivo, start=1):
-            # Linhas vazias são ignoradas.
             if not linha.strip():
                 continue
-
             try:
-                # Cada linha deve conter um objeto JSON independente.
                 dados.append(json.loads(linha))
             except json.JSONDecodeError as erro:
-                # Repassa um erro mais informativo para facilitar a correção
-                # do arquivo de entrada.
                 raise ValueError(
                     f'JSON inválido na linha {numero_linha}: {erro}'
                 ) from erro
 
-    # Converte os registros para um DataFrame.
-    df = pd.DataFrame(dados)
+    dados_expandidos = expandir_registros_por_linha(dados)
+    df = pd.DataFrame(dados_expandidos)
 
-    # message_id é necessário para rastrear decisões manuais; summary é o
-    # campo que contém o texto principal a ser limpo e embutido.
-    colunas_essenciais = ['message_id', 'summary']
+    colunas_essenciais = ['message_id', 'original_message_id', 'summary']
     faltantes = [col for col in colunas_essenciais if col not in df.columns]
     if faltantes:
-        raise ValueError(
-            f'Colunas obrigatórias ausentes no dataset: {faltantes}'
-        )
+        raise ValueError(f'Colunas obrigatórias ausentes no dataset: {faltantes}')
 
-    # Impede identificadores ausentes, que comprometeriam a auditoria.
     if df['message_id'].isna().any():
-        raise ValueError('Há message_id ausentes no dataset.')
-
-    # Impede IDs duplicados, que poderiam fazer uma decisão manual atingir
-    # mais de um documento.
+        raise ValueError('Há message_id ausentes no dataset expandido.')
     if df['message_id'].duplicated().any():
-        raise ValueError('Há message_id duplicados no dataset.')
+        raise ValueError('Há message_id duplicados no dataset expandido.')
 
-    # Copia o DataFrame antes de adicionar ou filtrar colunas.
     df = df.copy()
-
-    # Aplica a limpeza à coluna summary e cria a coluna texto_limpo.
     df['texto_limpo'] = df['summary'].apply(limpar_texto_ia)
-
-    # Remove documentos que ficaram sem conteúdo após a limpeza.
     df = df[df['texto_limpo'].str.strip() != ''].copy()
 
-    # Interrompe com mensagem clara se não houver documentos aproveitáveis.
     if df.empty:
         raise ValueError('Nenhum documento válido após a limpeza.')
 
     return df
 
-
 # ---------------------------------------------------------------------------
-# Embeddings, UMAP e HDBSCAN
+# Embeddings, PCA e HDBSCAN
 # ---------------------------------------------------------------------------
 
 
-def aplicar_umap_hdbscan(
+def aplicar_pca_hdbscan(
     df,
     modelo_nome=MODEL_NAME,
     batch_size=DEFAULT_BATCH_SIZE,
     min_cluster_size=DEFAULT_MIN_CLUSTER_SIZE,
 ):
     """
-    Aplica embeddings semânticos, UMAP adaptativo e HDBSCAN.
+    Aplica embeddings semânticos, PCA determinística e HDBSCAN.
 
-    O HDBSCAN recebe os cinco ou menos componentes produzidos pelo UMAP,
-    e não o texto bruto nem diretamente a matriz original de embeddings.
+    O HDBSCAN recebe até dez componentes produzidos pela PCA, e não o texto
+    bruto nem diretamente a matriz original de embeddings.
     """
 
-    # UMAP precisa de uma quantidade mínima de documentos para formar uma
-    # representação de vizinhança útil.
+    # A PCA precisa de pelo menos três documentos para produzir uma redução
+    # útil antes do agrupamento.
     if len(df) < 3:
         raise ValueError('São necessários pelo menos três documentos válidos.')
 
@@ -480,13 +542,32 @@ def aplicar_umap_hdbscan(
     if min_cluster_size <= 0:
         raise ValueError('min_cluster_size deve ser maior que zero.')
 
-    # Converte o texto da coluna para uma lista na ordem do DataFrame.
-    documentos = df['texto_limpo'].tolist()
+    # Combina o subject com o trecho limpo para dar contexto aos fragmentos
+    # curtos. O subject original continua preservado separadamente no CSV.
+    subjects = (
+        df['subject'].fillna('').astype(str).tolist()
+        if 'subject' in df.columns
+        else [''] * len(df)
+    )
+    textos_limpos = df['texto_limpo'].tolist()
+    documentos = [
+        (
+            f'subject: {subject}. content: {texto}'
+            if subject.strip()
+            else f'content: {texto}'
+        )
+        for subject, texto in zip(subjects, textos_limpos)
+    ]
 
     print('   -> Carregando modelo e gerando embeddings por tokens...')
 
     # O modelo pode ser baixado na primeira execução se não estiver no cache.
-    modelo = SentenceTransformer(modelo_nome)
+    # trust_remote_code=True é exigido pelo Nomic em versões antigas das
+    # bibliotecas SentenceTransformers e Transformers.
+    modelo = SentenceTransformer(
+        modelo_nome,
+        trust_remote_code=True,
+    )
 
     # Gera um embedding agregado para cada documento.
     embeddings = embedding_documentos_longos(
@@ -495,43 +576,43 @@ def aplicar_umap_hdbscan(
         batch_size=batch_size,
     )
 
-    # Para bases pequenas, reduz n_neighbors para não exceder o número de
-    # documentos disponíveis. No dataset principal, o valor permanece 15.
-    n_neighbors = min(15, len(df) - 1)
-
-    # Reduz n_components em bases muito pequenas; para bases grandes, usa 5.
-    n_components = min(5, len(df) - 1)
+    # A PCA preserva as principais direções de variância dos embeddings.
+    # O solver completo não usa aleatoriedade e torna a redução reprodutível.
+    n_components = min(
+        PCA_COMPONENTS,
+        len(df) - 1,
+        embeddings.shape[1],
+    )
 
     print(
-        f'   -> UMAP com n_neighbors={n_neighbors}, '
-        f'n_components={n_components}...'
+        f'   -> PCA determinística com n_components={n_components}...'
     )
 
-    # Reduz a dimensionalidade usando distância cosseno, apropriada para
-    # embeddings semânticos normalizados.
-    umap_model = UMAP(
-        n_neighbors=n_neighbors,
+    pca_model = PCA(
         n_components=n_components,
-        min_dist=0.0,
-        metric='cosine',
-        random_state=RANDOM_STATE,
+        svd_solver='full',
     )
-    embeddings_reduzidos = umap_model.fit_transform(embeddings)
+    embeddings_reduzidos = pca_model.fit_transform(embeddings)
 
     # Evita solicitar min_cluster_size maior que a própria base em datasets
     # pequenos. No dataset principal, o parâmetro permanece 15.
     tamanho_cluster = min(min_cluster_size, len(df))
 
+    min_samples = min(HDBSCAN_MIN_SAMPLES, tamanho_cluster)
+
     print(
-        f'   -> HDBSCAN com min_cluster_size={tamanho_cluster}...'
+        f'   -> HDBSCAN com min_cluster_size={tamanho_cluster}, '
+        f'min_samples={min_samples}...'
     )
 
     # HDBSCAN agrupa os pontos pela densidade. Documentos sem uma atribuição
     # suficientemente confiável podem receber o rótulo -1.
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=tamanho_cluster,
+        min_samples=min_samples,
         metric='euclidean',
         cluster_selection_method='eom',
+        core_dist_n_jobs=1,
     )
 
     # Copia o DataFrame para não modificar silenciosamente o objeto recebido.
@@ -573,18 +654,25 @@ def gerar_amostra_para_auditoria(
     # dos rótulos na saída, incluindo o cluster -1 antes dos demais.
     for cluster, indices in df.groupby('cluster', sort=True).groups.items():
         # Seleciona os registros pertencentes ao cluster atual.
-        grupo = df.loc[indices]
+        grupo = df.loc[indices].copy()
 
-        # Para clusters menores que n_amostras, seleciona todos os registros.
-        quantidade = min(len(grupo), n_amostras)
-
-        # random_state fixo torna a seleção reproduzível.
-        partes.append(
-            grupo.sample(
-                n=quantidade,
-                random_state=SAMPLE_RANDOM_STATE,
-            )
+        # Um relatório original pode ter vários trechos no mesmo cluster.
+        # Embaralhamos os registros e mantemos apenas o primeiro trecho de
+        # cada original_message_id. Assim, a amostra representa relatórios
+        # originais diferentes, e não várias linhas do mesmo relatório.
+        grupo = grupo.sample(
+            frac=1,
+            random_state=SAMPLE_RANDOM_STATE,
         )
+        grupo = grupo.drop_duplicates(
+            subset=['original_message_id'],
+            keep='first',
+        )
+
+        # Se houver menos relatórios originais que n_amostras, seleciona todos
+        # os IDs disponíveis; caso contrário, seleciona exatamente n_amostras.
+        quantidade = min(len(grupo), n_amostras)
+        partes.append(grupo.head(quantidade))
 
     # Uma base sem clusters não pode gerar amostra.
     if not partes:
@@ -597,6 +685,7 @@ def gerar_amostra_para_auditoria(
     # decisões. A função falha explicitamente se alguma estiver ausente.
     colunas_obrigatorias = [
         'message_id',
+        'original_message_id',
         'cluster',
         'subject',
         'summary',
@@ -613,6 +702,8 @@ def gerar_amostra_para_auditoria(
     # existem na base.
     colunas_desejadas = [
         'message_id',
+        'original_message_id',
+        'summary_line_number',
         'cluster',
         'subject',
         'source_tag',
@@ -658,12 +749,16 @@ def salvar_parametros(
 
     parametros = {
         'modelo_embeddings': modelo_nome,
+        'prefixo_embedding': NOMIC_TASK_PREFIX,
         'batch_size': batch_size,
         'min_cluster_size': min_cluster_size,
+        'min_samples_hdbscan': HDBSCAN_MIN_SAMPLES,
+        'pca_components_max': PCA_COMPONENTS,
         'n_amostras_por_cluster': n_amostras,
-        'random_state_umap': RANDOM_STATE,
+        'reducao_dimensionalidade': DETERMINISTIC_DIMENSIONALITY_REDUCTION,
         'random_state_amostragem': SAMPLE_RANDOM_STATE,
-        'pipeline': 'limpeza -> embeddings por tokens -> UMAP -> HDBSCAN',
+        'determinismo_clusterizacao': True,
+        'pipeline': 'limpeza -> embeddings por tokens -> PCA -> HDBSCAN',
     }
 
     # ensure_ascii=False preserva caracteres acentuados no JSON.
@@ -697,10 +792,10 @@ if __name__ == '__main__':
     df_limpo = carregar_e_limpar_dados(caminho_do_arquivo)
     print(f'Documentos válidos: {len(df_limpo)}')
 
-    print('\nIniciando pipeline (embeddings -> UMAP -> HDBSCAN)...')
+    print('\nIniciando pipeline (embeddings -> PCA -> HDBSCAN)...')
 
     # Gera embeddings, reduz a dimensionalidade e atribui clusters.
-    df_final = aplicar_umap_hdbscan(df_limpo)
+    df_final = aplicar_pca_hdbscan(df_limpo)
 
     print('\n=== Resumo dos clusters ===')
 

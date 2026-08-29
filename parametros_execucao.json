@@ -1,9 +1,13 @@
 {
-  "modelo_embeddings": "BAAI/bge-m3",
-  "batch_size": 32,
+  "modelo_embeddings": "nomic-ai/nomic-embed-text-v1.5",
+  "prefixo_embedding": "clustering: ",
+  "batch_size": 16,
   "min_cluster_size": 15,
+  "min_samples_hdbscan": 5,
+  "pca_components_max": 50,
   "n_amostras_por_cluster": 3,
-  "random_state_umap": 10,
+  "reducao_dimensionalidade": "PCA(svd_solver=full)",
   "random_state_amostragem": 42,
-  "pipeline": "limpeza -> embeddings por tokens -> UMAP -> HDBSCAN"
+  "determinismo_clusterizacao": true,
+  "pipeline": "limpeza -> embeddings por tokens -> PCA -> HDBSCAN"
 }
