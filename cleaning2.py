@@ -9,7 +9,7 @@ Fluxo geral:
       -> divisão dos documentos em blocos compatíveis com o tokenizer
       -> embeddings semânticos com SentenceTransformer
       -> média dos embeddings dos blocos por documento
-      -> redução de dimensionalidade com PCA determinística
+      -> redução de dimensionalidade com UMAP reprodutível por seed fixa
       -> agrupamento com HDBSCAN
       -> exportação da base completa
       -> geração de amostra para revisão manual
@@ -36,7 +36,7 @@ import hdbscan
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.decomposition import PCA
+from umap import UMAP
 
 # SentenceTransformer gera embeddings semânticos dos textos.
 from sentence_transformers import SentenceTransformer
@@ -64,9 +64,16 @@ NOMIC_TASK_PREFIX = 'clustering: '
 # Ela não participa da geração dos clusters.
 SAMPLE_RANDOM_STATE = 42
 
-# A redução de dimensionalidade usa PCA com svd_solver='full', que não
-# depende de uma seed aleatória.
-DETERMINISTIC_DIMENSIONALITY_REDUCTION = 'PCA(svd_solver=full)'
+# Seed fixa usada pelo UMAP para tornar a projeção reproduzível no mesmo
+# ambiente, com as mesmas versões, hardware e ordem dos dados.
+RANDOM_STATE = 42
+
+# Parâmetros do UMAP usados antes do HDBSCAN.
+UMAP_COMPONENTS = 10
+UMAP_N_NEIGHBORS = 15
+UMAP_MIN_DIST = 0.0
+UMAP_METRIC = 'cosine'
+DETERMINISTIC_DIMENSIONALITY_REDUCTION = 'UMAP(random_state=42)'
 
 # Quantidade padrão de documentos selecionados para cada cluster na amostra.
 DEFAULT_SAMPLE_SIZE = 3
@@ -79,10 +86,6 @@ DEFAULT_BATCH_SIZE = 16
 # Limite desejado de tokens por bloco. O Nomic aceita sequências longas,
 # mas blocos de 512 tokens evitam misturar subtemas durante o clustering.
 MAX_TOKENS_POR_BLOCO = 512
-
-# Número máximo de componentes usados pela PCA antes do HDBSCAN.
-# Até 50 componentes preservam mais informação sem retornar à dimensão completa.
-PCA_COMPONENTS = 50
 
 # Sensibilidade do HDBSCAN à densidade local. Valores menores permitem que
 # mais pontos entrem em clusters, mas podem reduzir a conservadoriedade.
@@ -432,19 +435,24 @@ def embedding_documentos_longos(
 
 def expandir_registros_por_linha(dados):
     """
-    Cria um registro independente para cada linha de ``summary``.
+    Cria registros a partir das linhas materiais de ``summary``.
 
-    Cada objeto do JSONL original é um relatório. Depois de decodificar o
-    JSON, o conteúdo do campo ``summary`` é dividido nas quebras de linha.
-    Para cada trecho, todos os metadados originais são copiados: ``sender``,
-    ``subject``, ``specialist``, ``source_type``, ``source_tag``, datas e
-    quaisquer outras colunas presentes no objeto original.
+    O título Markdown inicial e os metadados de cabeçalho não viram documentos
+    independentes. Headers de seção, como ``### Context``, são preservados
+    apenas como contexto e anexados ao próximo trecho material.
 
-    Como um ``message_id`` original pode gerar vários registros, ele é mantido
-    em ``original_message_id``. O novo ``message_id`` recebe um sufixo de linha
-    para continuar sendo único e permitir uma decisão manual inequívoca.
+    Todos os novos registros herdam os metadados do relatório original.
+    ``original_message_id`` preserva a origem, enquanto ``message_id`` recebe
+    um sufixo único para permitir decisões manuais por trecho.
     """
     registros_expandidos = []
+
+    # Linhas que fazem parte do cabeçalho estrutural inicial do relatório.
+    padrao_metadado = re.compile(
+        r'^\s*\*{0,2}(source|focus|general comment|theme|markets|author|date)\s*:',
+        flags=re.IGNORECASE,
+    )
+    padrao_header = re.compile(r'^\s*#{1,6}\s+')
 
     for registro in dados:
         registro_original = dict(registro)
@@ -452,14 +460,43 @@ def expandir_registros_por_linha(dados):
         summary = registro_original.get('summary')
 
         if not isinstance(summary, str):
-            partes = ['']
+            linhas = []
         else:
-            # ``splitlines`` trata \\n, \\r\\n e outras quebras usuais.
-            # Linhas vazias são ignoradas, pois não representam conteúdo.
-            partes = [parte.strip() for parte in summary.splitlines() if parte.strip()]
-            if not partes:
-                partes = ['']
+            linhas = [linha.strip() for linha in summary.splitlines()]
 
+        partes = []
+        header_pendente = ''
+        inicio = True
+
+        for linha in linhas:
+            if not linha:
+                continue
+
+            # O primeiro header de nível 1 é o título do relatório. Como o
+            # subject já é preservado e também enviado ao embedding, o título
+            # não é criado como um documento separado. Mantemos `inicio=True`
+            # para que os metadados seguintes também sejam ignorados.
+            if inicio and re.match(r'^\s*#\s+', linha):
+                continue
+
+            # Metadados consecutivos ao título formam o cabeçalho inicial e
+            # também não devem ser documentos independentes.
+            if inicio and padrao_metadado.match(linha):
+                continue
+
+            inicio = False
+
+            # Headers internos não são documentos: ficam pendentes e são
+            # anexados ao próximo conteúdo material.
+            if padrao_header.match(linha):
+                header_pendente = re.sub(r'^\s*#{1,6}\s+', '', linha).strip()
+                continue
+
+            parte = f'{header_pendente}. {linha}' if header_pendente else linha
+            partes.append(parte.strip())
+            header_pendente = ''
+
+        # Se o relatório só tinha cabeçalho, ele não gera registro material.
         for numero_linha, parte in enumerate(partes, start=1):
             novo_registro = dict(registro_original)
             novo_registro['original_message_id'] = id_original
@@ -516,24 +553,24 @@ def carregar_e_limpar_dados(caminho_arquivo):
     return df
 
 # ---------------------------------------------------------------------------
-# Embeddings, PCA e HDBSCAN
+# Embeddings, UMAP e HDBSCAN
 # ---------------------------------------------------------------------------
 
 
-def aplicar_pca_hdbscan(
+def aplicar_umap_hdbscan(
     df,
     modelo_nome=MODEL_NAME,
     batch_size=DEFAULT_BATCH_SIZE,
     min_cluster_size=DEFAULT_MIN_CLUSTER_SIZE,
 ):
     """
-    Aplica embeddings semânticos, PCA determinística e HDBSCAN.
+    Aplica embeddings semânticos, UMAP reprodutível e HDBSCAN.
 
-    O HDBSCAN recebe até dez componentes produzidos pela PCA, e não o texto
-    bruto nem diretamente a matriz original de embeddings.
+    O HDBSCAN recebe os componentes produzidos pelo UMAP, e não o texto bruto
+    nem diretamente a matriz original de embeddings.
     """
 
-    # A PCA precisa de pelo menos três documentos para produzir uma redução
+    # O UMAP precisa de pelo menos três documentos para produzir uma redução
     # útil antes do agrupamento.
     if len(df) < 3:
         raise ValueError('São necessários pelo menos três documentos válidos.')
@@ -576,23 +613,24 @@ def aplicar_pca_hdbscan(
         batch_size=batch_size,
     )
 
-    # A PCA preserva as principais direções de variância dos embeddings.
-    # O solver completo não usa aleatoriedade e torna a redução reprodutível.
-    n_components = min(
-        PCA_COMPONENTS,
-        len(df) - 1,
-        embeddings.shape[1],
-    )
+    # O UMAP preserva melhor as vizinhanças locais e a estrutura de densidade
+    # dos embeddings, que será usada pelo HDBSCAN.
+    n_neighbors = min(UMAP_N_NEIGHBORS, len(df) - 1)
+    n_components = min(UMAP_COMPONENTS, len(df) - 1)
 
     print(
-        f'   -> PCA determinística com n_components={n_components}...'
+        f'   -> UMAP com n_neighbors={n_neighbors}, '
+        f'n_components={n_components}, random_state={RANDOM_STATE}...'
     )
 
-    pca_model = PCA(
+    umap_model = UMAP(
+        n_neighbors=n_neighbors,
         n_components=n_components,
-        svd_solver='full',
+        min_dist=UMAP_MIN_DIST,
+        metric=UMAP_METRIC,
+        random_state=RANDOM_STATE,
     )
-    embeddings_reduzidos = pca_model.fit_transform(embeddings)
+    embeddings_reduzidos = umap_model.fit_transform(embeddings)
 
     # Evita solicitar min_cluster_size maior que a própria base em datasets
     # pequenos. No dataset principal, o parâmetro permanece 15.
@@ -753,12 +791,16 @@ def salvar_parametros(
         'batch_size': batch_size,
         'min_cluster_size': min_cluster_size,
         'min_samples_hdbscan': HDBSCAN_MIN_SAMPLES,
-        'pca_components_max': PCA_COMPONENTS,
         'n_amostras_por_cluster': n_amostras,
         'reducao_dimensionalidade': DETERMINISTIC_DIMENSIONALITY_REDUCTION,
         'random_state_amostragem': SAMPLE_RANDOM_STATE,
         'determinismo_clusterizacao': True,
-        'pipeline': 'limpeza -> embeddings por tokens -> PCA -> HDBSCAN',
+        'pipeline': 'limpeza -> embeddings por tokens -> UMAP -> HDBSCAN',
+        'random_state_umap': RANDOM_STATE,
+        'umap_n_neighbors': UMAP_N_NEIGHBORS,
+        'umap_n_components': UMAP_COMPONENTS,
+        'umap_min_dist': UMAP_MIN_DIST,
+        'umap_metric': UMAP_METRIC,
     }
 
     # ensure_ascii=False preserva caracteres acentuados no JSON.
@@ -792,10 +834,10 @@ if __name__ == '__main__':
     df_limpo = carregar_e_limpar_dados(caminho_do_arquivo)
     print(f'Documentos válidos: {len(df_limpo)}')
 
-    print('\nIniciando pipeline (embeddings -> PCA -> HDBSCAN)...')
+    print('\nIniciando pipeline (embeddings -> UMAP -> HDBSCAN)...')
 
-    # Gera embeddings, reduz a dimensionalidade e atribui clusters.
-    df_final = aplicar_pca_hdbscan(df_limpo)
+    # Gera embeddings, reduz a dimensionalidade com UMAP e atribui clusters.
+    df_final = aplicar_umap_hdbscan(df_limpo)
 
     print('\n=== Resumo dos clusters ===')
 

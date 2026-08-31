@@ -4,10 +4,14 @@
   "batch_size": 16,
   "min_cluster_size": 15,
   "min_samples_hdbscan": 5,
-  "pca_components_max": 50,
   "n_amostras_por_cluster": 3,
-  "reducao_dimensionalidade": "PCA(svd_solver=full)",
+  "reducao_dimensionalidade": "UMAP(random_state=42)",
   "random_state_amostragem": 42,
   "determinismo_clusterizacao": true,
-  "pipeline": "limpeza -> embeddings por tokens -> PCA -> HDBSCAN"
+  "pipeline": "limpeza -> embeddings por tokens -> UMAP -> HDBSCAN",
+  "random_state_umap": 42,
+  "umap_n_neighbors": 15,
+  "umap_n_components": 10,
+  "umap_min_dist": 0.0,
+  "umap_metric": "cosine"
 }
