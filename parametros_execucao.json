@@ -2,7 +2,7 @@
   "modelo_embeddings": "nomic-ai/nomic-embed-text-v1.5",
   "prefixo_embedding": "clustering: ",
   "batch_size": 16,
-  "min_cluster_size": 15,
+  "min_cluster_size": 40,
   "min_samples_hdbscan": 5,
   "n_amostras_por_cluster": 3,
   "reducao_dimensionalidade": "UMAP(random_state=42)",

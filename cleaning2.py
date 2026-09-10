@@ -27,18 +27,13 @@ import os
 # Deve ser definido antes do carregamento do PyTorch.
 os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 
-# Biblioteca padrão para limpeza e identificação de padrões textuais por regex.
 import re
 from pathlib import Path
-# HDBSCAN identifica regiões de maior densidade e atribui -1 a documentos
-# que não pertencem a uma região suficientemente densa.
 import hdbscan
 import numpy as np
 import pandas as pd
 import torch
 from umap import UMAP
-
-# SentenceTransformer gera embeddings semânticos dos textos.
 from sentence_transformers import SentenceTransformer
 
 # Solicita algoritmos determinísticos no PyTorch. warn_only=True evita que uma
@@ -92,7 +87,7 @@ MAX_TOKENS_POR_BLOCO = 512
 HDBSCAN_MIN_SAMPLES = 5
 
 # Tamanho mínimo padrão para que o HDBSCAN forme um cluster válido.
-DEFAULT_MIN_CLUSTER_SIZE = 15
+DEFAULT_MIN_CLUSTER_SIZE = 40
 
 
 # ---------------------------------------------------------------------------
